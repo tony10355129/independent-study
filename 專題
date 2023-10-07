@@ -1,0 +1,186 @@
+#引入模組
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+from torchvision import datasets, transforms
+import matplotlib.pyplot as plt
+import numpy as np
+from torch.utils.data import Subset
+from scipy.optimize import curve_fit
+
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+batch_size = 100
+learning_rate = 0.01
+epochs = 3
+num_train = 14400
+num_test = 2400
+
+input_size = 784
+hidden_size = 10
+num_classes = 3
+
+
+
+#載入人工神經元資料
+with open('Neu Ta1_p40_1618_Ix=-18E-3A_Hx=0E+0Oe_Pulse Width=80.000000E-6s_Read I=1E-3A.txt', 'r') as file:
+    lines = file.readlines()
+
+weights_list = []
+for line in lines[1:]: 
+    columns = line.split() 
+    if(float(columns[1]) < - 0.1):
+        weights_list.append(float(columns[1]))  
+
+weights_list = sorted(weights_list)
+length = len(weights_list)
+first = weights_list[0]
+last = weights_list[-2] 
+
+weights_x = []
+
+for i in range(length):
+    value = weights_list[i]
+    weights_list[i] = (value - first) * 3 / (last - first) - 1.5
+    weights_x.append(i)
+
+
+
+#載入擬合Sigmoid函數資料
+def sigmoid(x, a, b):
+    return 1.0 / (1.0 + np.exp(-a*x - b))
+
+with open('SOT Ta1_Ix=39E-3A_Hx=0E+0Oe_Pulse Width=80.000000E-6s_Read I=1E-3A.txt', 'r') as file:
+    lines = file.readlines()
+
+current = [float(line.split()[0]) for line in lines[1:]]
+resistence = [float(line.split()[1]) for line in lines[1:]]
+
+target_current = [current[i] for i in range(len(current)) if i >= 80 and resistence[i] >= -0.7]
+target_resistence = [resistence[i] for i in range(len(current)) if i >= 80 and resistence[i] >= -0.7]
+target_resistence = sorted(target_resistence)
+first_resistence = target_resistence[0]
+last_resistence = target_resistence[-1]
+for i in range(len(target_resistence)):
+    value = target_resistence[i]
+    target_resistence[i] = (value - first_resistence) / (last_resistence - first_resistence)
+
+first_current = target_current[0]
+last_current = target_current[-1]
+for i in range(len(target_current)):
+    value = target_current[i]
+    target_current[i] = (value - first_current) * 27.5 / (last_current - first_current) - 8.5
+
+target_current = np.array(target_current)
+target_resistence = np.array(target_resistence)
+popt, _ = curve_fit(sigmoid, target_current, target_resistence)
+
+#加載EMIST資料集
+transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
+
+train_dataset = torchvision.datasets.EMNIST(root='./data', split='byclass', train=True, transform=transform, download=True)
+test_dataset = torchvision.datasets.EMNIST(root='./data', split='byclass', train=False, transform=transform, download=True)
+
+# 過濾掉除了C=12, G=16, U=30以外的數據
+def filter_letters(dataset, classes):
+    indices = []
+    for i, (image, label) in enumerate(dataset):
+        if label in classes:
+            indices.append(i)
+    return indices
+
+train_indices = filter_letters(train_dataset, [12, 16, 30])
+test_indices = filter_letters(test_dataset, [12, 16, 30])
+
+#將訓練樣本洗牌以保持隨機性
+train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=100, shuffle=False, sampler=torch.utils.data.SubsetRandomSampler(train_indices[:num_train]))
+test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=100, shuffle=False, sampler=torch.utils.data.SubsetRandomSampler(test_indices[:num_test]))
+
+
+#自訂激活函數(Sigmoid)
+class CustomSigmoid(nn.Module):
+    def __init__(self, a, b):
+        super(CustomSigmoid, self).__init__()
+        self.a = a
+        self.b = b
+
+    def forward(self, x):
+        return 1.0 / (1.0 + torch.exp(-self.a * x - self.b))
+a, b = popt
+
+#自訂人工神經網路
+def map_to_closest(val, values_list):
+    return min(values_list, key=lambda x: abs(x - val))
+
+class CustomNN(nn.Module):
+    def __init__(self, input_size, hidden_size, num_classes, weight_values):
+        super(CustomNN, self).__init__()
+        self.weight_values = weight_values
+        self.layer1 = CustomLinearLayer(input_size, hidden_size, self.weight_values)
+        self.custom_sigmoid = CustomSigmoid(a, b)
+        self.layer2 = CustomLinearLayer(hidden_size, num_classes, self.weight_values)
+
+    def forward(self, x):
+        out = self.layer1(x)
+        out = self.custom_sigmoid(out)
+        out = self.layer2(out)
+        return out
+    
+    def map_weights(self):
+        self.layer1.map_weights()
+        self.layer2.map_weights()
+
+class CustomLinearLayer(nn.Module):
+    def __init__(self, in_features, out_features, weight_values):
+        super(CustomLinearLayer, self).__init__()
+        self.weight_values = weight_values
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(out_features))
+    def forward(self, input):
+        return nn.functional.linear(input, self.weight, self.bias)
+
+    def map_weights(self):
+        new_weight = torch.empty_like(self.weight)
+        for i in range(self.weight.size(0)):
+            for j in range(self.weight.size(1)):
+                new_weight[i, j] = map_to_closest(self.weight[i, j].item(), self.weight_values) 
+        self.weight.data = new_weight 
+        self.weight.data = self.weight.data.float()  # Ensure the data type remains float  
+
+model = CustomNN(input_size, hidden_size, num_classes, weights_list).to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr = learning_rate)
+
+train_accuracies = []
+iterations = []
+#訓練模型
+for epoch in range(epochs):
+    correct_train = 0
+    total_train = 0
+    for i, (images, labels) in enumerate(train_loader):
+        images = images.reshape(-1, 28*28).to(device)
+        labels_map = {12: 0, 16: 1, 30: 2}
+        labels = torch.Tensor([labels_map[l.item()] for l in labels]).long().to(device)
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        model.map_weights()
+
+        _, predicted = outputs.max(1)
+        correct_train += (predicted == labels).sum().item()
+        total_train += labels.size(0)
+
+        if (i+1) % 2 == 0:
+            train_accuracies.append(100 * correct_train / total_train)
+            iterations.append((epoch * len(train_loader)) + (i+1))
+            print(f'Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}, Accuracy: {train_accuracies[-1]:.2f}%')
+
+print('Finished Training')
+
+
+
